@@ -226,7 +226,13 @@ class Transformer(nn.Module):
 
         # text conditioning
 
-        self.encode_text = partial(t5_encode_text, name = t5_name)
+        # self.encode_text = partial(t5_encode_text, name = t5_name)
+        def encode_text_wrapper(texts):
+            device = next(self.parameters()).device
+            text_embeds = t5_encode_text(texts, name = t5_name, output_device = device)
+            return text_embeds
+            
+        self.encode_text = encode_text_wrapper
 
         text_embed_dim = get_encoded_dim(t5_name)
 
@@ -504,6 +510,7 @@ class MaskGit(nn.Module):
         cond_scale = 3,
         critic_noise_scale = 1
     ):
+        
         fmap_size = default(fmap_size, self.vae.get_encoded_fmap_size(self.image_size))
 
         # begin with all image token ids masked
@@ -556,11 +563,10 @@ class MaskGit(nn.Module):
         for timestep, steps_until_x0 in tqdm(zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))), total = timesteps):
 
             rand_mask_prob = self.noise_schedule(timestep)
-            num_token_masked = max(int((rand_mask_prob * seq_len).item()), 1)
+            num_token_masked = max(int((rand_mask_prob * seq_len).item()), 1) # the number of tokens that should be masked on this timestep
 
-            masked_indices = scores.topk(num_token_masked, dim = -1).indices
-
-            ids = ids.scatter(1, masked_indices, self.mask_id)
+            masked_indices = scores.topk(num_token_masked, dim = -1).indices # select tokens with the highest scores, [B, num_token_masked]
+            ids = ids.scatter(1, masked_indices, self.mask_id) # mask the tokens with the highest scores, [B, 256]
 
             logits, embed = demask_fn(
                 ids,
@@ -573,11 +579,11 @@ class MaskGit(nn.Module):
 
             self_cond_embed = embed if self.self_cond else None
 
-            filtered_logits = top_k(logits, topk_filter_thres)
+            filtered_logits = top_k(logits, topk_filter_thres) # [B, 256, 65536] filter out tokens with very low probabilities
 
             temperature = starting_temperature * (steps_until_x0 / timesteps) # temperature is annealed
 
-            pred_ids = gumbel_sample(filtered_logits, temperature = temperature, dim = -1)
+            pred_ids = gumbel_sample(filtered_logits, temperature = temperature, dim = -1) # [B, 256] sample the ids for the next timestep
 
             is_mask = ids == self.mask_id
 
@@ -585,7 +591,7 @@ class MaskGit(nn.Module):
                 is_mask,
                 pred_ids,
                 ids
-            )
+            ) # at this step, all ids are unmasked, but it will be masked again in the next timestep
 
             if use_token_critic:
                 scores = token_critic_fn(
@@ -600,13 +606,13 @@ class MaskGit(nn.Module):
                 scores = scores + (uniform(scores.shape, device = device) - 0.5) * critic_noise_scale * (steps_until_x0 / timesteps)
 
             else:
-                probs_without_temperature = logits.softmax(dim = -1)
+                probs_without_temperature = logits.softmax(dim = -1) # [B, 256, 65536]
 
-                scores = 1 - probs_without_temperature.gather(2, pred_ids[..., None])
-                scores = rearrange(scores, '... 1 -> ...')
+                scores = 1 - probs_without_temperature.gather(2, pred_ids[..., None]) # get the 1-probabilities of the sampled ids
+                scores = rearrange(scores, '... 1 -> ...') # [B, 256]
 
                 if not can_remask_prev_masked:
-                    scores = scores.masked_fill(~is_mask, -1e5)
+                    scores = scores.masked_fill(~is_mask, -1e5) # set the score of the already unmasked tokens to a negative value to prevent them from being changed
                 else:
                     assert self.no_mask_token_prob > 0., 'without training with some of the non-masked tokens forced to predict, not sure if the logits will be meaningful for these token'
 
@@ -633,13 +639,12 @@ class MaskGit(nn.Module):
         sample_temperature = None
     ):
         # tokenize if needed
-
-        if images_or_ids.dtype == torch.float:
+        if images_or_ids.dtype == torch.float: # [ B, 3, 256, 256 ]
             assert exists(self.vae), 'vqgan vae must be passed in if training from raw images'
             assert all([height_or_width == self.image_size for height_or_width in images_or_ids.shape[-2:]]), 'the image you passed in is not of the correct dimensions'
 
             with torch.no_grad():
-                _, ids, _ = self.vae.encode(images_or_ids)
+                _, ids, _ = self.vae.encode(images_or_ids) # [ B, 16, 16 ]
         else:
             assert not self.resize_image_for_cond_image, 'you cannot pass in raw image token ids if you want the framework to autoresize image for conditioning super res transformer'
             ids = images_or_ids
@@ -651,7 +656,7 @@ class MaskGit(nn.Module):
 
         # get some basic variables
 
-        ids = rearrange(ids, 'b ... -> b (...)')
+        ids = rearrange(ids, 'b ... -> b (...)') # [ B, 256 ]
 
         batch, seq_len, device, cond_drop_prob = *ids.shape, ids.device, default(cond_drop_prob, self.cond_drop_prob)
 
@@ -674,28 +679,28 @@ class MaskGit(nn.Module):
 
         mask_id = self.mask_id
         batch_randperm = torch.rand((batch, seq_len), device = device).argsort(dim = -1)
-        mask = batch_randperm < rearrange(num_token_masked, 'b -> b 1')
+        mask = batch_randperm < rearrange(num_token_masked, 'b -> b 1') # [ B, 256 ]
 
         mask_id = self.transformer.mask_id
-        labels = torch.where(mask, ids, ignore_index)
+        labels = torch.where(mask, ids, ignore_index) # [ B, 256 ], unmasked tokens takes ignore_index
 
         if self.no_mask_token_prob > 0.:
             no_mask_mask = get_mask_subset_prob(mask, self.no_mask_token_prob)
-            mask &= ~no_mask_mask
+            mask &= ~no_mask_mask # [B, 256] unmask a subset of the masked tokens
 
         x = torch.where(mask, mask_id, ids)
 
         # get text embeddings
 
         if exists(texts):
-            text_embeds = self.transformer.encode_text(texts)
+            text_embeds = self.transformer.encode_text(texts) #
             texts = None
 
         # self conditioning
 
         self_cond_embed = None
 
-        if self.transformer.self_cond and random() < self.self_cond_prob:
+        if True or self.transformer.self_cond and random() < self.self_cond_prob:
             with torch.no_grad():
                 _, self_cond_embed = self.transformer(
                     x,
@@ -705,7 +710,7 @@ class MaskGit(nn.Module):
                     return_embed = True
                 )
 
-                self_cond_embed.detach_()
+                self_cond_embed.detach_() # [B, 256, 512]
 
         # get loss
 
@@ -718,7 +723,8 @@ class MaskGit(nn.Module):
             cond_drop_prob = cond_drop_prob,
             ignore_index = ignore_index,
             return_logits = True
-        )
+        ) # logits: [B, 256, 65536]
+
 
         if not exists(self.token_critic) or train_only_generator:
             return ce_loss
@@ -727,8 +733,8 @@ class MaskGit(nn.Module):
 
         sampled_ids = gumbel_sample(logits, temperature = default(sample_temperature, random()))
 
-        critic_input = torch.where(mask, sampled_ids, x)
-        critic_labels = (ids != critic_input).float()
+        critic_input = torch.where(mask, sampled_ids, x) # if masked, use the sampled ids, otherwise use the original ids
+        critic_labels = (ids != critic_input).float() # critic labels are 1 if the original id is not the sampled id, 0 otherwise
 
         bce_loss = self.token_critic(
             critic_input,

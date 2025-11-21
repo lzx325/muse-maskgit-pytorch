@@ -95,5 +95,5 @@ def t5_encode_text(
     if not exists(output_device):
         return encoded_text
 
-    encoded_text.to(output_device)
+    encoded_text = encoded_text.to(output_device)
     return encoded_text
