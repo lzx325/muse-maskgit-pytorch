@@ -1,3 +1,4 @@
+from imaplib import ParseFlags
 import math
 from random import random
 from functools import partial
@@ -43,13 +44,13 @@ def l2norm(t):
 
 # tensor helpers
 
-def get_mask_subset_prob(mask, prob, min_mask = 0):
+def get_mask_subset_prob(mask, prob, scores = None, min_mask = 0):
     batch, seq, device = *mask.shape, mask.device
     num_to_mask = (mask.sum(dim = -1, keepdim = True) * prob).clamp(min = min_mask)
-    logits = torch.rand((batch, seq), device = device)
-    logits = logits.masked_fill(~mask, -1)
+    scores = default(scores, torch.rand((batch, seq), device = device))
+    scores = scores.masked_fill(~mask, -1)
 
-    randperm = logits.argsort(dim = -1).argsort(dim = -1).float()
+    randperm = scores.argsort(dim = -1).argsort(dim = -1).float()
 
     num_padding = (~mask).sum(dim = -1, keepdim = True)
     randperm -= num_padding
@@ -170,7 +171,8 @@ class TransformerBlocks(nn.Module):
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
-        flash = True
+        flash = True,
+        cross_attend = True
     ):
         super().__init__()
         self.layers = nn.ModuleList([])
@@ -178,7 +180,7 @@ class TransformerBlocks(nn.Module):
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Attention(dim = dim, dim_head = dim_head, heads = heads, flash = flash),
-                Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend = True, flash = flash),
+                Attention(dim = dim, dim_head = dim_head, heads = heads, cross_attend = cross_attend, flash = flash),
                 FeedForward(dim = dim, mult = ff_mult)
             ]))
 
@@ -231,7 +233,7 @@ class Transformer(nn.Module):
             device = next(self.parameters()).device
             text_embeds = t5_encode_text(texts, name = t5_name, output_device = device)
             return text_embeds
-            
+
         self.encode_text = encode_text_wrapper
 
         text_embed_dim = get_encoded_dim(t5_name)
@@ -300,28 +302,31 @@ class Transformer(nn.Module):
 
         # prepare texts
 
-        assert exists(texts) ^ exists(text_embeds)
+        if exists(texts) ^ exists(text_embeds):
 
-        if exists(texts):
-            text_embeds = self.encode_text(texts)
+            if exists(texts):
+                text_embeds = self.encode_text(texts)
 
-        context = self.text_embed_proj(text_embeds)
+            context = self.text_embed_proj(text_embeds)
 
-        context_mask = (text_embeds != 0).any(dim = -1)
+            context_mask = (text_embeds != 0).any(dim = -1)
 
-        # classifier free guidance
+            # classifier free guidance
 
-        if cond_drop_prob > 0.:
-            mask = prob_mask_like((b, 1), 1. - cond_drop_prob, device)
-            context_mask = context_mask & mask
+            if cond_drop_prob > 0.:
+                mask = prob_mask_like((b, 1), 1. - cond_drop_prob, device)
+                context_mask = context_mask & mask
 
-        # concat conditioning image token ids if needed
+            # concat conditioning image token ids if needed
 
-        if exists(conditioning_token_ids):
-            conditioning_token_ids = rearrange(conditioning_token_ids, 'b ... -> b (...)')
-            cond_token_emb = self.token_emb(conditioning_token_ids)
-            context = torch.cat((context, cond_token_emb), dim = -2)
-            context_mask = F.pad(context_mask, (0, conditioning_token_ids.shape[-1]), value = True)
+            if exists(conditioning_token_ids):
+                conditioning_token_ids = rearrange(conditioning_token_ids, 'b ... -> b (...)')
+                cond_token_emb = self.token_emb(conditioning_token_ids)
+                context = torch.cat((context, cond_token_emb), dim = -2)
+                context_mask = F.pad(context_mask, (0, conditioning_token_ids.shape[-1]), value = True)
+        else:
+            assert not (exists(texts) and exists(text_embeds)), 'if you pass in both texts and text_embeds, you should not pass in conditioning_token_ids'
+            context, context_mask = None, None
 
         # embed tokens
 
@@ -625,6 +630,81 @@ class MaskGit(nn.Module):
 
         images = self.vae.decode_from_ids(ids)
         return images
+
+    @torch.no_grad()
+    @eval_decorator
+    def unmask(
+        self,
+        ids: torch.Tensor,
+        fmap_size = None,
+        temperature = 1.,
+        topk_filter_thres = 0.9,
+        can_remask_prev_masked = False,
+        force_not_use_token_critic = False,
+        timesteps = 18,
+        critic_noise_scale = 1
+    ):
+        fmap_size = default(fmap_size, self.vae.get_encoded_fmap_size(self.image_size))
+        device = next(self.parameters()).device
+
+        seq_len = fmap_size ** 2
+        batch_size = ids.shape[0]
+
+        shape = (batch_size, seq_len)
+
+        assert ids.shape == shape, 'ids must be of shape (batch_size, seq_len)'
+
+        scores = torch.zeros(shape, dtype = torch.float32, device = device)
+        initial_mask_indices = ids == self.mask_id
+
+        starting_temperature = temperature
+
+        demask_fn = self.transformer.forward
+
+        use_token_critic = exists(self.token_critic) and not force_not_use_token_critic
+
+        if use_token_critic:
+            token_critic_fn = self.token_critic.forward
+        
+        self_cond_embed = None
+
+        for timestep, steps_until_x0 in tqdm(zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))), total = timesteps):
+            rand_mask_prob = self.noise_schedule(timestep)
+            no_mask_indices = get_mask_subset_prob(initial_mask_indices, 1-rand_mask_prob, scores = scores)
+            mask_indices = initial_mask_indices & ~no_mask_indices
+            ids = torch.where(mask_indices, self.mask_id, ids)
+
+            logits, embed = demask_fn(
+                ids,
+                self_cond_embed = self_cond_embed,
+                return_embed = True
+            )
+
+            self_cond_embed = embed if self.self_cond else None
+
+            filtered_logits = top_k(logits, topk_filter_thres)
+            temperature = starting_temperature * (steps_until_x0 / timesteps)
+            pred_ids = gumbel_sample(filtered_logits, temperature = temperature, dim = -1)
+            ids = torch.where(mask_indices, pred_ids, ids)
+
+            if use_token_critic:
+                scores = token_critic_fn(
+                    ids
+                )
+
+                scores = rearrange(scores, '... 1 -> ...')
+
+                scores = scores + (uniform(scores.shape, device = device) - 0.5) * critic_noise_scale * (steps_until_x0 / timesteps)
+            else:
+                probs_without_temperature = logits.softmax(dim = -1)
+                scores = 1 - probs_without_temperature.gather(2, pred_ids[..., None])
+                scores = rearrange(scores, '... 1 -> ...')
+                if not can_remask_prev_masked:
+                    scores = scores.masked_fill(~mask_indices, -1e5)
+                else:
+                    assert self.no_mask_token_prob > 0., 'without training with some of the non-masked tokens forced to predict, not sure if the logits will be meaningful for these token'
+
+        return ids
 
     def forward(
         self,
