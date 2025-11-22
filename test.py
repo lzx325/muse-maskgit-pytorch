@@ -1,3 +1,4 @@
+import os
 import torch
 from muse_maskgit_pytorch import VQGanVAE, VQGanVAETrainer, MaskGitTransformer, MaskGit
 
@@ -111,8 +112,66 @@ def main3():
 
     indices_um = base_maskgit.unmask(indices_m, timesteps = 6)
     print(indices_um[:,:6])
+
+def main4():
+    # set seed
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    from einops import rearrange
+    from muse_maskgit_pytorch.trainers import MaskGitTrainer
+
+    vae = VQGanVAE(
+        dim = 256,
+        codebook_size = 65536
+    )
+
+    transformer = MaskGitTransformer(
+        num_tokens = 65536,       # must be same as codebook size above
+        seq_len = 256,            # must be equivalent to fmap_size ** 2 in vae
+        dim = 512,                # model dimension
+        depth = 8,                # depth
+        dim_head = 64,            # attention head dimension
+        heads = 8,                # attention heads,
+        ff_mult = 4,              # feedforward expansion factor
+        t5_name = 't5-small',     # name of your T5
+        cross_attend = False
+    )
+
+    base_maskgit = MaskGit(
+        vae = vae,                 # vqgan vae
+        transformer = transformer, # transformer
+        image_size = 256,          # image size
+        cond_drop_prob = 0.25,     # conditional dropout, for classifier free guidance
+    )
+
+    ckpt_fp = os.path.join("bulk_data/checkpoints/maskgit_ckpt.pt")
+    image_codes_fp = os.path.join("bulk_data/image_codes.pt")
+
+    trainer = MaskGitTrainer(
+        model = base_maskgit
+    )
+
+    if True:
+        images = torch.randn(4, 3, 256, 256)
+        fmap, image_codes, vq_aux_loss = vae.encode(images) # fmap: (B, 2048, 16, 16), indices (B, 16, 16)
+        image_codes = rearrange(image_codes, 'b ... -> b (...)')
+        torch.save(image_codes, image_codes_fp)
+        
+        trainer.train(image_codes = image_codes, log_fn = print)
+        torch.save(base_maskgit.state_dict(), ckpt_fp)
+    else:
+        base_maskgit.load_state_dict(torch.load(ckpt_fp))
+        image_codes = torch.load(image_codes_fp)
+    
+    image_codes_m = trainer.apply_mask(image_codes)
+    image_codes_um = base_maskgit.unmask(image_codes_m, timesteps = 10)
+    print((image_codes_um==image_codes).float().mean())
     import pdb; pdb.set_trace()
 
 if __name__ == '__main__':
-    main3()
+    main4()
     

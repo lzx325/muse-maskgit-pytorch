@@ -16,6 +16,7 @@ from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
 
 from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
+from muse_maskgit_pytorch.muse_maskgit_pytorch import MaskGit
 
 from einops import rearrange
 
@@ -413,3 +414,54 @@ class VQGanVAETrainer(nn.Module):
             log_fn(logs)
 
         self.print('training complete')
+
+@beartype
+class MaskGitTrainer(object):
+    def __init__(
+        self,
+        model: MaskGit,
+    ):
+        super().__init__()
+
+        self.model = model
+        self.optimizer = Adam(self.model.parameters(), lr = 1e-4)
+        self.n_global_iter = 22
+    
+    def apply_mask(self, img_codes: torch.Tensor, mask_id: int = None):
+        if mask_id is None:
+            mask_id = self.model.mask_id
+        mask_pos = torch.arange(100)
+        mask_indices = mask_pos.repeat(img_codes.shape[0], 1)
+        img_codes_m = img_codes.scatter(1, mask_indices, mask_id)
+        return img_codes_m
+    
+    def train_step(
+        self,
+        img_codes: torch.Tensor,
+        global_iter: int
+    ):
+        device = next(self.model.parameters()).device
+
+        self.model.train()
+
+        img_codes = img_codes.to(device)
+
+        img_codes_m = self.apply_mask(img_codes)
+
+        labels = torch.where(img_codes_m==self.model.mask_id, img_codes, -1)
+        
+
+        loss = self.model.forward_unconditional(img_codes_m, labels = labels, ignore_index = -1)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
+    
+    def train(self, image_codes: torch.Tensor, log_fn = noop):
+        device = next(self.model.parameters()).device
+        image_codes = image_codes.to(device)
+        for global_iter in range(self.n_global_iter):
+            loss = self.train_step(image_codes, global_iter)
+            log_fn(loss)

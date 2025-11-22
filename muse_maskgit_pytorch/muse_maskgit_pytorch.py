@@ -669,10 +669,15 @@ class MaskGit(nn.Module):
         self_cond_embed = None
 
         for timestep, steps_until_x0 in tqdm(zip(torch.linspace(0, 1, timesteps, device = device), reversed(range(timesteps))), total = timesteps):
+            
             rand_mask_prob = self.noise_schedule(timestep)
             no_mask_indices = get_mask_subset_prob(initial_mask_indices, 1-rand_mask_prob, scores = scores)
             mask_indices = initial_mask_indices & ~no_mask_indices
+
+            
+
             ids = torch.where(mask_indices, self.mask_id, ids)
+
 
             logits, embed = demask_fn(
                 ids,
@@ -780,7 +785,7 @@ class MaskGit(nn.Module):
 
         self_cond_embed = None
 
-        if True or self.transformer.self_cond and random() < self.self_cond_prob:
+        if self.transformer.self_cond and random() < self.self_cond_prob:
             with torch.no_grad():
                 _, self_cond_embed = self.transformer(
                     x,
@@ -825,6 +830,68 @@ class MaskGit(nn.Module):
         )
 
         return ce_loss + self.critic_loss_weight * bce_loss
+
+    def forward_unconditional(
+        self,
+        masked_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        ignore_index = -1,
+        return_logits = False
+    ):
+        """
+        Forward function for unconditional unmasking (no conditional images or texts).
+        
+        Args:
+            masked_ids: Tensor of shape (batch, seq_len) containing masked token ids
+            labels: Optional tensor of shape (batch, seq_len) containing unmasked token ids for loss computation
+            ignore_index: Index to ignore in loss computation (default: -1)
+            return_logits: If True and labels are provided, return both loss and logits
+        
+        Returns:
+            If labels are provided:
+                - If return_logits is False: loss tensor
+                - If return_logits is True: (loss, logits) tuple
+            If labels are not provided:
+                - logits tensor
+        """
+        # Ensure masked_ids is 2D
+        masked_ids = rearrange(masked_ids, 'b ... -> b (...)')
+        
+        batch, seq_len, device = *masked_ids.shape, masked_ids.device
+        
+        # Prepare self conditioning if enabled
+        self_cond_embed = None
+        
+        if self.transformer.self_cond and random() < self.self_cond_prob:
+            with torch.no_grad():
+                _, self_cond_embed = self.transformer(
+                    masked_ids,
+                    self_cond_embed = None,
+                    return_embed = True
+                )
+                self_cond_embed.detach_()
+        
+        # Forward through transformer without any conditioning
+        if exists(labels):
+            # Compute loss
+            loss, logits = self.transformer(
+                masked_ids,
+                labels = labels,
+                ignore_index = ignore_index,
+                self_cond_embed = self_cond_embed,
+                return_logits = True
+            )
+            
+            if return_logits:
+                return loss, logits
+            return loss
+        else:
+            # Just return logits
+            logits = self.transformer(
+                masked_ids,
+                self_cond_embed = self_cond_embed
+            )
+            return logits
 
 # final Muse class
 
